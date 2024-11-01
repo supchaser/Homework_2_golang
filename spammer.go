@@ -2,7 +2,8 @@ package main
 
 import (
 	"fmt"
-	"sort"
+	"log"
+	"slices"
 	"sync"
 )
 
@@ -12,8 +13,9 @@ func RunPipeline(cmds ...cmd) {
 	}
 
 	channels := make([]chan interface{}, len(cmds)+1)
+	bufferSize := 10
 	for i := range channels {
-		channels[i] = make(chan interface{})
+		channels[i] = make(chan interface{}, bufferSize)
 	}
 
 	wg := sync.WaitGroup{}
@@ -33,16 +35,24 @@ func RunPipeline(cmds ...cmd) {
 func SelectUsers(in, out chan interface{}) {
 	wg := sync.WaitGroup{}
 	mu := sync.Mutex{}
-	m := make(map[uint64]string)
-	for str := range in {
+	uniqueUsers := make(map[uint64]string)
+
+	for userID := range in {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			person := GetUser(str.(string))
+
+			userIDStr, ok := userID.(string)
+			if !ok {
+				log.Printf("Invalid type for userID: %T", userID)
+			}
+
+			person := GetUser(userIDStr)
 			mu.Lock()
 			defer mu.Unlock()
-			if _, ok := m[person.ID]; !ok {
-				m[person.ID] = person.Email
+
+			if _, ok := uniqueUsers[person.ID]; !ok {
+				uniqueUsers[person.ID] = person.Email
 				out <- person
 			}
 		}()
@@ -52,101 +62,116 @@ func SelectUsers(in, out chan interface{}) {
 }
 
 func SelectMessages(in, out chan interface{}) {
-	wg := sync.WaitGroup{}
-	container := make([]User, 0, 2)
-	mu := sync.Mutex{}
-	for user := range in {
-		mu.Lock()
-		container = append(container, user.(User))
-		if len(container) == 2 {
-			currentUser1, currentUser2 := container[0], container[1]
-			container = make([]User, 0, 2)
-			mu.Unlock()
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				msgID, err := GetMessages(currentUser1, currentUser2)
-				if err != nil {
-					fmt.Println("Ошибка в GetMessages: ", err)
-					return
-				}
-				for _, id := range msgID {
-					out <- id
-				}
-			}()
-		} else {
-			mu.Unlock()
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	batchLen := GetMessagesMaxUsersBatch
+	container := make([]User, 0, batchLen)
+
+	userToMsgID := func(users []User) {
+		defer wg.Done()
+
+		msgID, err := GetMessages(users...)
+		if err != nil {
+			fmt.Println("Ошибка в GetMessages: ", err)
+			return
+		}
+
+		for _, id := range msgID {
+			out <- id
 		}
 	}
 
-	mu.Lock()
-	if len(container) == 1 {
-		currentUser := container[0]
+	for user := range in {
+		mu.Lock()
+
+		userCastInUser, ok := user.(User)
+		if !ok {
+			log.Printf("Invalid type for user: %T", user)
+			mu.Unlock()
+			continue
+		}
+
+		container = append(container, userCastInUser)
+
+		if len(container) != batchLen {
+			mu.Unlock()
+			continue
+		}
+
+		containerCopy := make([]User, len(container))
+		copy(containerCopy, container)
+		container = make([]User, 0, batchLen)
 		mu.Unlock()
+
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			msgID, err := GetMessages(currentUser)
-			if err != nil {
-				fmt.Println("Ошибка в GetMessages: ", err)
-				return
-			}
-			for _, id := range msgID {
-				out <- id
-			}
-		}()
-	} else {
-		mu.Unlock()
+		go userToMsgID(containerCopy)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(container) > 0 {
+		wg.Add(1)
+		go userToMsgID(container)
 	}
 
 	wg.Wait()
 }
 
 func CheckSpam(in, out chan interface{}) {
-	const goRoutinesNum = 5
-	workerInput := make(chan MsgID)
+	goRoutinesNum := HasSpamMaxAsyncRequests
 	wg := sync.WaitGroup{}
 
 	for i := 0; i < goRoutinesNum; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for msgID := range workerInput {
+			for msgID := range in {
+				msgIDCastInMsgID, ok := msgID.(MsgID)
+				if !ok {
+					log.Printf("Invalid type for msgID: %T", msgID)
+					continue
+				}
+
 				var msgData MsgData
 				var err error
-				msgData.ID = msgID
+
+				msgData.ID = msgIDCastInMsgID
 				msgData.HasSpam, err = HasSpam(msgData.ID)
 				if err != nil {
 					fmt.Println("Ошибка в CheckSpam: ", err)
 					continue
 				}
+
 				out <- msgData
 			}
 		}()
 	}
 
-	go func() {
-		defer close(workerInput)
-		for id := range in {
-			workerInput <- id.(MsgID)
-		}
-	}()
-
 	wg.Wait()
 }
 
 func CombineResults(in, out chan interface{}) {
-	container := make([]MsgData, 0)
+	const capacityContainer = 10
+	container := make([]MsgData, 0, capacityContainer)
 
 	for msgData := range in {
 		container = append(container, msgData.(MsgData))
 	}
 
-	sort.Slice(container, func(i, j int) bool {
-		if container[i].HasSpam == container[j].HasSpam {
-			return container[i].ID < container[j].ID
+	slices.SortFunc(container, func(a, b MsgData) int {
+		if a.HasSpam == b.HasSpam {
+			if a.ID < b.ID {
+				return -1
+			} else if a.ID > b.ID {
+				return 1
+			}
+			return 0
 		}
-		return container[i].HasSpam
+		if a.HasSpam {
+			return -1
+		}
+		return 1
 	})
 
 	for _, msgData := range container {
