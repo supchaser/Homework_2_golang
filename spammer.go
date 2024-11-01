@@ -73,7 +73,7 @@ func SelectMessages(in, out chan interface{}) {
 
 		msgID, err := GetMessages(users...)
 		if err != nil {
-			fmt.Println("Ошибка в GetMessages: ", err)
+			log.Printf("Ошибка в GetMessages: %v", err)
 			return
 		}
 
@@ -82,30 +82,29 @@ func SelectMessages(in, out chan interface{}) {
 		}
 	}
 
-	for user := range in {
+	mainUserToMsgID := func(user interface{}) {
 		mu.Lock()
+		defer mu.Unlock()
 
 		userCastInUser, ok := user.(User)
 		if !ok {
 			log.Printf("Invalid type for user: %T", user)
-			mu.Unlock()
-			continue
+			return
 		}
 
 		container = append(container, userCastInUser)
+		if len(container) == batchLen {
+			containerCopy := make([]User, len(container))
+			copy(containerCopy, container)
+			container = make([]User, 0, batchLen)
 
-		if len(container) != batchLen {
-			mu.Unlock()
-			continue
+			wg.Add(1)
+			go userToMsgID(containerCopy)
 		}
+	}
 
-		containerCopy := make([]User, len(container))
-		copy(containerCopy, container)
-		container = make([]User, 0, batchLen)
-		mu.Unlock()
-
-		wg.Add(1)
-		go userToMsgID(containerCopy)
+	for user := range in {
+		mainUserToMsgID(user)
 	}
 
 	mu.Lock()
@@ -139,7 +138,7 @@ func CheckSpam(in, out chan interface{}) {
 				msgData.ID = msgIDCastInMsgID
 				msgData.HasSpam, err = HasSpam(msgData.ID)
 				if err != nil {
-					fmt.Println("Ошибка в CheckSpam: ", err)
+					log.Printf("Ошибка в CheckSpam: %v", err)
 					continue
 				}
 
