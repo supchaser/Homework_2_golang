@@ -45,6 +45,7 @@ func SelectUsers(in, out chan interface{}) {
 			userIDStr, ok := userID.(string)
 			if !ok {
 				log.Printf("Invalid type for userID: %T", userID)
+				return
 			}
 
 			person := GetUser(userIDStr)
